@@ -162,22 +162,63 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src1->type == src0->type);
+    GGML_ASSERT(dst->type  == src0->type);
 
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        const float * src0_d = (const float *)src0->data;
-        const float * src1_d = (const float *)src1->data;
+        const size_t ts = ggml_type_size(src0->type);
+        const char * src0_d = (const char *)src0->data;
+        const char * src1_d = (const char *)src1->data;
+        char * dst_d = (char *)dst->data;
 
-        float * dst_d = (float *)dst->data;
+        // For non-F32, use generic cudaMemcpy-based concat
+        if (src0->type != GGML_TYPE_F32) {
+            const size_t row_size = dst->ne[0] * ts;
+            const size_t src0_row_size = src0->ne[0] * ts;
+            const size_t src1_row_size = src1->ne[0] * ts;
+            for (int64_t i3 = 0; i3 < dst->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < dst->ne[2]; i2++) {
+            for (int64_t i1 = 0; i1 < dst->ne[1]; i1++) {
+                size_t dst_off = ((i3*dst->ne[2] + i2)*dst->ne[1] + i1) * row_size;
+                if (dim == 0) {
+                    if (i1 < src0->ne[1] && i2 < src0->ne[2] && i3 < src0->ne[3]) {
+                        size_t s0_off = ((i3*src0->ne[2] + i2)*src0->ne[1] + i1) * row_size;
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src0_d + s0_off, src0_row_size, cudaMemcpyDeviceToDevice, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off + src0_row_size, src1_d + ((i3*src1->ne[2] + i2)*src1->ne[1] + i1)*src1_row_size, src1_row_size, cudaMemcpyDeviceToDevice, stream));
+                    }
+                } else if (dim == 1) {
+                    if (i1 < src0->ne[1] && i2 < src0->ne[2] && i3 < src0->ne[3])
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src0_d + ((i3*src0->ne[2] + i2)*src0->ne[1] + i1)*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                    else
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src1_d + ((i3*src1->ne[2] + i2)*src1->ne[1] + (i1-src0->ne[1]))*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                } else if (dim == 2) {
+                    if (i2 < src0->ne[2] && i3 < src0->ne[3])
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src0_d + ((i3*src0->ne[2] + i2)*src0->ne[1] + i1)*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                    else
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src1_d + ((i3*src1->ne[2] + (i2-src0->ne[2]))*src1->ne[1] + i1)*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                } else {
+                    const size_t src0_plane = src0->ne[0]*src0->ne[1]*ts;
+                    const size_t src1_plane = src1->ne[0]*src1->ne[1]*ts;
+                    if (i3 < src0->ne[3])
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src0_d + i3*src0_plane + (i2*src0->ne[1]+i1)*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                    else
+                        CUDA_CHECK(cudaMemcpyAsync(dst_d + dst_off, src1_d + (i3-src0->ne[3])*src1_plane + (i2*src1->ne[1]+i1)*row_size, row_size, cudaMemcpyDeviceToDevice, stream));
+                }
+            }}}
+            return;
+        }
+
+        const float * src0_d_f = (const float *)src0->data;
+        const float * src1_d_f = (const float *)src1->data;
+        float * dst_d_f = (float *)dst->data;
 
         if (dim != 3) {
             for (int i3 = 0; i3 < dst->ne[3]; i3++) {
                 concat_f32_cuda(
-                        src0_d + i3 * (src0->nb[3] / 4),
-                        src1_d + i3 * (src1->nb[3] / 4),
-                        dst_d + i3 * ( dst->nb[3] / 4),
+                        src0_d_f + i3 * (src0->nb[3] / 4),
+                        src1_d_f + i3 * (src1->nb[3] / 4),
+                        dst_d_f + i3 * ( dst->nb[3] / 4),
                         src0->ne[0], src0->ne[1], src0->ne[2],
                         dst->ne[0],  dst->ne[1],  dst->ne[2], dim, stream);
             }
@@ -185,8 +226,8 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             const size_t size0 = ggml_nbytes(src0);
             const size_t size1 = ggml_nbytes(src1);
 
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,           src0_d, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0/4, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(dst_d_f,         src0_d_f, size0, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(dst_d_f + size0/4, src1_d_f, size1, cudaMemcpyDeviceToDevice, stream));
         }
     } else {
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
