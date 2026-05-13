@@ -1856,6 +1856,12 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:
         case GGML_OP_DSV4_ROPE_TAIL:
             return false;
+        case GGML_OP_REPEAT:
+            {
+                // ggml_cuda_op_bin_bcast only supports F32/F16; reject others so they stay on CPU
+                ggml_type src0_type = op->src[0]->type;
+                return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
+            }
         default:
             return true;
     }
