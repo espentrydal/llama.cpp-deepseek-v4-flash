@@ -18,6 +18,11 @@
 #include <filesystem>
 #include <algorithm>
 
+// Weak reference to CUDA flash-attn support check from libggml-cuda.so.
+// Resolves at runtime; nullptr if no CUDA backend is loaded.
+extern "C" bool ggml_cuda_flash_attn_ext_supported_for_rpc(const struct ggml_tensor * dst) __attribute__((weak));
+
+
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
@@ -1862,6 +1867,13 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_F16;
             }
+        case GGML_OP_FLASH_ATTN_EXT:
+            // Delegate to the CUDA backend own check (head-dim/type constraints vary).
+            // Weak reference resolves from libggml-cuda.so at runtime; null = no CUDA.
+            if (ggml_cuda_flash_attn_ext_supported_for_rpc) {
+                return ggml_cuda_flash_attn_ext_supported_for_rpc(op);
+            }
+            return false;
         default:
             return true;
     }

@@ -528,3 +528,13 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+// C-linkage wrapper so ggml-rpc.cpp can query flash-attn support
+// without including CUDA headers. Uses device 0 as representative of
+// all identical GPUs (valid in homogeneous clusters like ai-smil1/2).
+extern "C" bool ggml_cuda_flash_attn_ext_supported_for_rpc(const struct ggml_tensor * dst) {
+    if (ggml_cuda_info().device_count == 0) {
+        return false;
+    }
+    return ggml_cuda_flash_attn_ext_supported(0, dst);
+}
