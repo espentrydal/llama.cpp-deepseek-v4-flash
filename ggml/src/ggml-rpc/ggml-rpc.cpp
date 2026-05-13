@@ -1276,11 +1276,6 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
-    // Sync all GPU backends before copy; pending async CUDA work from graph_compute
-    // on any device may not be complete, and cudaMemcpy against in-flight data crashes.
-    for (auto & b : backends) {
-        ggml_backend_synchronize(b);
-    }
     response.result = ggml_backend_buffer_copy_tensor(src, dst);
     return true;
 }
