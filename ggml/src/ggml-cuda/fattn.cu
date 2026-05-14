@@ -6,6 +6,211 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+// ---------------------------------------------------------------------------
+// Small-K flash-attention kernel (head_dim=512, 1 <= K.ne[1] < FATTN_KQ_STRIDE)
+//
+// Targets V100, which has no compiled kernel for head_dim=512 once K.ne[1] is
+// not a multiple of FATTN_KQ_STRIDE=256. DSV4 Flash hits this case at every
+// decode step (single key), falling back to CPU and crushing throughput. This
+// kernel uses one CUDA block per (sequence, head_q, query) and does a direct
+// GEMV-softmax-GEMV — compute is trivial; only kernel-launch overhead matters.
+// ---------------------------------------------------------------------------
+
+template<int D>
+__launch_bounds__(128, 1)
+static __global__ void flash_attn_small_k_kernel(
+        const char * __restrict__ Q,
+        const char * __restrict__ K,
+        const char * __restrict__ V,
+        const char * __restrict__ mask,
+        const char * __restrict__ sinks,
+        float      * __restrict__ dst,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne01, const int32_t ne02,
+        const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne11, const int32_t ne12,
+        const int32_t nb11, const int32_t nb12, const int64_t nb13,
+        const int32_t nb21, const int32_t nb22, const int64_t nb23,
+        const int32_t ne33, const int32_t nb31, const int64_t nb33) {
+#ifdef FLASH_ATTN_AVAILABLE
+    constexpr int NTH = 128;
+    static_assert(D % NTH == 0, "D must be divisible by NTH=128");
+    constexpr int IPT = D / NTH;
+    static_assert(NTH % WARP_SIZE == 0, "NTH must be a multiple of warp size");
+    constexpr int NWARP = NTH / WARP_SIZE;
+
+    const int tid       = threadIdx.x;
+    const int iq        = blockIdx.x;   // query within sequence
+    const int head      = blockIdx.y;   // Q head
+    const int sequence  = blockIdx.z;   // batch / sequence id
+    const int gqa_ratio = ne02 / ne12;
+    const int head_kv   = head / gqa_ratio;
+
+    const float * Qf = (const float *)(Q + sequence*nb03 + head*nb02 + iq*nb01);
+    const char  * Kb =                  K + sequence*nb13 + head_kv*nb12;
+    const char  * Vb =                  V + sequence*nb23 + head_kv*nb22;
+    const half  * Mh = mask
+        ? (const half *)(mask + (sequence % ne33)*nb33 + iq*nb31)
+        : nullptr;
+
+    const int n_kv = ne11;
+
+    // Load Q chunk into registers (IPT contiguous elements per thread).
+    float Qreg[IPT];
+    #pragma unroll
+    for (int i = 0; i < IPT; ++i) {
+        Qreg[i] = Qf[tid*IPT + i];
+    }
+
+    const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    __shared__ float kq_smem[FATTN_KQ_STRIDE];
+    __shared__ float warp_smem[NWARP];
+
+    // Phase 1: KQ[n] = scale * (Q . K[:,n]) [+ softcap, ALiBi, mask]
+    for (int n = 0; n < n_kv; ++n) {
+        const half * Kh = (const half *)(Kb + n*nb11);
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < IPT; ++i) {
+            partial += Qreg[i] * __half2float(Kh[tid*IPT + i]);
+        }
+        partial = warp_reduce_sum(partial);
+        if ((tid & (WARP_SIZE - 1)) == 0) {
+            warp_smem[tid / WARP_SIZE] = partial;
+        }
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+            float v = (tid < NWARP) ? warp_smem[tid] : 0.0f;
+            v = warp_reduce_sum(v);
+            if (tid == 0) {
+                v *= scale;
+                if (logit_softcap != 0.0f) {
+                    v = logit_softcap * tanhf(v);
+                }
+                if (Mh) {
+                    v += slope * __half2float(Mh[n]);
+                }
+                kq_smem[n] = v;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Phase 2: softmax(kq) (+ sink).
+    __shared__ float inv_sum_smem;
+    __shared__ float sink_weight_smem;
+    if (tid == 0) {
+        float m = -FLT_MAX/2.0f;
+        for (int n = 0; n < n_kv; ++n) {
+            m = fmaxf(m, kq_smem[n]);
+        }
+        const bool has_sink = (sinks != nullptr);
+        const float sink_v  = has_sink ? ((const float *) sinks)[head] : 0.0f;
+        if (has_sink) {
+            m = fmaxf(m, sink_v);
+        }
+        float sum = 0.0f;
+        for (int n = 0; n < n_kv; ++n) {
+            const float e = expf(kq_smem[n] - m);
+            kq_smem[n] = e;
+            sum += e;
+        }
+        if (has_sink) {
+            sum += expf(sink_v - m);
+        }
+        inv_sum_smem     = 1.0f / sum;
+        sink_weight_smem = has_sink ? expf(sink_v - m) : 0.0f;
+        (void) sink_weight_smem;  // Sink contributes to denominator only.
+    }
+    __syncthreads();
+    const float inv_sum = inv_sum_smem;
+
+    // Phase 3: out[d] = (sum_n weights[n] * V[n,d]) * inv_sum.
+    float Vacc[IPT];
+    #pragma unroll
+    for (int i = 0; i < IPT; ++i) Vacc[i] = 0.0f;
+    for (int n = 0; n < n_kv; ++n) {
+        const half * Vh = (const half *)(Vb + n*nb21);
+        const float w = kq_smem[n];
+        #pragma unroll
+        for (int i = 0; i < IPT; ++i) {
+            Vacc[i] += w * __half2float(Vh[tid*IPT + i]);
+        }
+    }
+    float * dst_row = dst + (((int64_t)sequence*ne01 + iq)*ne02 + head)*D;
+    #pragma unroll
+    for (int i = 0; i < IPT; ++i) {
+        dst_row[tid*IPT + i] = Vacc[i] * inv_sum;
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, dst, scale, max_bias, m0, m1,
+        n_head_log2, logit_softcap,
+        ne01, ne02, nb01, nb02, nb03,
+        ne11, ne12, nb11, nb12, nb13,
+        nb21, nb22, nb23, ne33, nb31, nb33);
+    NO_DEVICE_CODE;
+#endif // FLASH_ATTN_AVAILABLE
+}
+
+static void ggml_cuda_flash_attn_ext_small_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * KQV  = dst;
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_ASSERT(Q->type == GGML_TYPE_F32);
+    GGML_ASSERT(K->type == GGML_TYPE_F16);
+    GGML_ASSERT(V->type == GGML_TYPE_F16);
+    GGML_ASSERT(K->ne[0] == 512);
+    GGML_ASSERT(V->ne[0] == 512);
+    GGML_ASSERT(K->ne[1] > 0 && K->ne[1] < FATTN_KQ_STRIDE);
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = Q->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const dim3 block_dim(128, 1, 1);
+    const dim3 grid_dim(Q->ne[1], Q->ne[2], Q->ne[3]);
+
+    cudaStream_t stream = ctx.stream();
+    flash_attn_small_k_kernel<512><<<grid_dim, block_dim, 0, stream>>>(
+        (const char *) Q->data,
+        (const char *) K->data,
+        (const char *) V->data,
+        mask  ? (const char *) mask->data  : nullptr,
+        sinks ? (const char *) sinks->data : nullptr,
+        (float *) KQV->data,
+        scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        (int32_t) Q->ne[1], (int32_t) Q->ne[2],
+        (int32_t) Q->nb[1], (int32_t) Q->nb[2], (int32_t) Q->nb[3],
+        (int32_t) K->ne[1], (int32_t) K->ne[2],
+        (int32_t) K->nb[1], (int32_t) K->nb[2], (int64_t) K->nb[3],
+        (int32_t) V->nb[1], (int32_t) V->nb[2], (int64_t) V->nb[3],
+        mask ? (int32_t) mask->ne[3] : 1,
+        mask ? (int32_t) mask->nb[1] : 0,
+        mask ? (int64_t) mask->nb[3] : 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -298,6 +503,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
+    BEST_FATTN_KERNEL_SMALL_K  =  50,
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_VEC      = 100,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
@@ -352,14 +558,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
-        case 512:
+        case 512: {
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             if (!gqa_opt_applies) {
+                // V100 lacks a head_dim=512 kernel when K.ne[1] % FATTN_KQ_STRIDE != 0.
+                // The DSV4 Flash decode path hits this every step. Dispatch to the
+                // small-K kernel iff K/V are F16 and K.ne[1] is in (0, FATTN_KQ_STRIDE).
+                if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                    K->ne[1] > 0 && K->ne[1] < FATTN_KQ_STRIDE &&
+                    (mask == nullptr || mask->type == GGML_TYPE_F16) &&
+                    max_bias == 0.0f) {
+                    return BEST_FATTN_KERNEL_SMALL_K;
+                }
                 return BEST_FATTN_KERNEL_NONE;
             }
-            break;
+        } break;
         case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
@@ -507,9 +722,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel which = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    switch (which) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
+        case BEST_FATTN_KERNEL_SMALL_K:
+            ggml_cuda_flash_attn_ext_small_k(ctx, dst);
+            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;

@@ -21,6 +21,7 @@
 // Weak reference to CUDA flash-attn support check from libggml-cuda.so.
 // Resolves at runtime; nullptr if no CUDA backend is loaded.
 extern "C" bool ggml_cuda_flash_attn_ext_supported_for_rpc(const struct ggml_tensor * dst) __attribute__((weak));
+extern "C" bool ggml_cuda_dsv4_supported_for_rpc(const struct ggml_tensor * dst) __attribute__((weak));
 
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -1407,7 +1408,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    ggml_backend_synchronize(backends[device]);
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1853,13 +1853,15 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
     //TODO: call the remote backend and cache the results
-    // DSV4 custom ops are CPU-only; must not be scheduled on remote CUDA via RPC
     switch (op->op) {
         case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
         case GGML_OP_DSV4_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_EXPAND:
         case GGML_OP_DSV4_FP8_KV_QUANTIZE:
         case GGML_OP_DSV4_ROPE_TAIL:
+            if (ggml_cuda_dsv4_supported_for_rpc) {
+                return ggml_cuda_dsv4_supported_for_rpc(op);
+            }
             return false;
         case GGML_OP_REPEAT:
             {

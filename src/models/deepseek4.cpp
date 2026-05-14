@@ -1107,26 +1107,31 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
 
                     store_index_cache_rows(index_kv, 0, n_comp);
 
-                    ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
-                            cur, qr, index_kv,
-                            layer.indexer_attn_q_b,
-                            layer.indexer_proj,
-                            inp_pos,
-                            index_mask,
-                            hparams.indexer_n_head,
-                            hparams.indexer_head_size,
-                            n_tokens,
-                            n_rot,
-                            rope_type,
-                            rope_cfg);
-                    cb(index_scores, "indexer_scores", il);
-
                     const int top_k = std::min<int64_t>(hparams.indexer_top_k, n_comp);
-                    ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
-                    cb(topk, "indexer_topk", il);
+                    ggml_tensor * comp_mask;
+                    if (top_k >= n_comp) {
+                        comp_mask = index_mask;
+                    } else {
+                        ggml_tensor * index_scores = dsv4_build_indexer_scores_prefill(ctx0,
+                                cur, qr, index_kv,
+                                layer.indexer_attn_q_b,
+                                layer.indexer_proj,
+                                inp_pos,
+                                index_mask,
+                                hparams.indexer_n_head,
+                                hparams.indexer_head_size,
+                                n_tokens,
+                                n_rot,
+                                rope_type,
+                                rope_cfg);
+                        cb(index_scores, "indexer_scores", il);
 
-                    ggml_tensor * comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
-                    cb(comp_mask, "dsv4_attn_compress_mask", il);
+                        ggml_tensor * topk = ggml_argsort_top_k(ctx0, index_scores, top_k);
+                        cb(topk, "indexer_topk", il);
+
+                        comp_mask = dsv4_build_compressed_mask_from_topk(ctx0, index_scores, topk);
+                        cb(comp_mask, "dsv4_attn_compress_mask", il);
+                    }
 
                     attn_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
                 } else {
