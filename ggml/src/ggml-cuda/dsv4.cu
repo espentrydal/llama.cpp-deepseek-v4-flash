@@ -452,6 +452,9 @@ bool ggml_cuda_dsv4_hc_split_sinkhorn_supported(const ggml_tensor * dst) {
         mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 &&
         dst->type == GGML_TYPE_F32 && mixes->nb[0] == sizeof(float) && scale->nb[0] == sizeof(float) &&
         base->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+        ggml_is_contiguous(scale) && ggml_is_contiguous(base) && ggml_are_same_shape(mixes, dst) &&
+        mixes->ne[2] == 1 && mixes->ne[3] == 1 &&
+        ggml_nelements(scale) >= 3 && ggml_nelements(base) >= mixes->ne[0] &&
         n_hc > 0 && n_hc <= 16 && sinkhorn_iters > 0 && mixes->ne[0] == (2 + n_hc) * n_hc;
 }
 
@@ -497,9 +500,12 @@ bool ggml_cuda_dsv4_rope_tail_supported(const ggml_tensor * dst) {
     const int n_dims = ggml_get_op_params_i32(dst, 0);
     const int mode = ggml_get_op_params_i32(dst, 1);
     return src0 && src1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 &&
-        (!src2 || src2->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32 &&
-        src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
-        n_dims <= src0->ne[0] && n_dims % 2 == 0 &&
+        (!src2 || (src2->type == GGML_TYPE_F32 && src2->nb[0] == sizeof(float) &&
+                   src2->ne[0] >= n_dims / 2)) &&
+        dst->type == GGML_TYPE_F32 && ggml_are_same_shape(src0, dst) &&
+        src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(int32_t) && dst->nb[0] == sizeof(float) &&
+        ggml_is_vector(src1) && src0->ne[2] == src1->ne[0] &&
+        n_dims > 0 && n_dims <= src0->ne[0] && n_dims % 2 == 0 &&
         (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX);
 }
 
@@ -515,6 +521,9 @@ void ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
         (uint64_t) dst->nb[1],
         ggml_get_op_params_f32(dst, 2),
     };
+    if (args.n_rows == 0) {
+        return;
+    }
     constexpr int nth = 256;
     dsv4_hc_split_sinkhorn_kernel<<<div_up_i64(args.n_rows, nth), nth, 0, ctx.stream()>>>(
         args, (const float *) mixes->data, (const float *) dst->src[1]->data,
@@ -533,6 +542,9 @@ void ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
     };
     constexpr int nth = 256;
     const int64_t n_elem = args.n_embd * args.n_tokens;
+    if (n_elem == 0) {
+        return;
+    }
     dsv4_hc_weighted_sum_kernel<<<div_up_i64(n_elem, nth), nth, 0, ctx.stream()>>>(
         args, (const char *) x->data, (const char *) weights->data, (char *) dst->data);
 }
@@ -553,6 +565,9 @@ void ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
     };
     constexpr int nth = 256;
     const int64_t n_elem = args.n_embd * args.n_hc * args.n_tokens;
+    if (n_elem == 0) {
+        return;
+    }
     dsv4_hc_expand_kernel<<<div_up_i64(n_elem, nth), nth, 0, ctx.stream()>>>(
         args, (const char *) block_out->data, (const char *) residual->data,
         (const char *) post->data, (const char *) comb->data, (char *) dst->data);
@@ -568,6 +583,9 @@ void ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
         ggml_get_op_params_i32(dst, 0),
     };
     const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
+    if (n_rows == 0) {
+        return;
+    }
     dsv4_fp8_kv_quantize_kernel<<<n_rows, 64, 0, ctx.stream()>>>(args, (const char *) src0->data, (char *) dst->data);
 }
 
@@ -575,6 +593,10 @@ void ggml_cuda_op_dsv4_rope_tail(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(ggml_cuda_dsv4_rope_tail_supported(dst));
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src2 = dst->src[2];
+    const int64_t n_elem = ggml_nelements(src0);
+    if (n_elem == 0) {
+        return;
+    }
     dsv4_rope_tail_args args = {
         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
         (uint64_t) src0->nb[0], (uint64_t) src0->nb[1], (uint64_t) src0->nb[2], (uint64_t) src0->nb[3],

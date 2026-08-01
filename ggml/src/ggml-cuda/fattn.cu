@@ -166,6 +166,10 @@ static void ggml_cuda_flash_attn_ext_small_k(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    if (K->ne[1] == 0 || ggml_nelements(Q) == 0) {
+        return;
+    }
+
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(K->type == GGML_TYPE_F16);
     GGML_ASSERT(V->type == GGML_TYPE_F16);
@@ -568,7 +572,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 // small-K kernel iff K/V are F16 and K.ne[1] is in (0, FATTN_KQ_STRIDE).
                 if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
                     K->ne[1] > 0 && K->ne[1] < FATTN_KQ_STRIDE &&
-                    (mask == nullptr || mask->type == GGML_TYPE_F16) &&
+                    (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[2] == 1)) &&
                     max_bias == 0.0f) {
                     return BEST_FATTN_KERNEL_SMALL_K;
                 }
